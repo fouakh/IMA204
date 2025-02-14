@@ -1,140 +1,167 @@
 import numpy as np
 from sklearn.decomposition import PCA
-from scipy.spatial import procrustes
+from scipy.spatial import Delaunay
+import cv2
+import matplotlib.pyplot as plt
+
 
 class ActiveAppearanceModel:
-    def __init__(self, shapes, textures):
+    def __init__(self, shapes, textures, texture_size):
         """
-        Initialise le modèle d'apparence active.
-        :param shapes: Liste des formes alignées (n_samples x n_points x 2).
-        :param textures: Liste des textures associées, normalisées à une forme moyenne.
+        Initialize the Active Appearance Model.
+        :param shapes: List of aligned shapes (n_samples x n_points x 2).
+        :param textures: List of associated textures, normalized to the mean shape.
+        :param texture_size: Size of texture images (width, height).
         """
-        self.shapes = shapes  # Données de forme
-        self.textures = textures  # Données de texture
+        self.shapes = shapes
+        self.textures = textures
+        self.texture_size = texture_size
 
     def build_shape_model(self):
         """
-        Construit un modèle statistique pour les formes.
+        Build a statistical model for shapes.
         """
-        print("Construction du modèle de forme...")
-        # Étape 1 : Alignement des formes avec l'analyse Procruste
-        aligned_shapes = []
-        reference_shape = self.shapes[0]
-        for shape in self.shapes:
-            _, aligned, _ = procrustes(reference_shape, shape)
-            aligned_shapes.append(aligned)
-        self.mean_shape = np.mean(aligned_shapes, axis=0)
+        print("Building shape model...")
+        shape_matrix = np.array([shape.flatten() for shape in self.shapes])
         
-        # Étape 2 : Conversion des formes en vecteurs
-        shape_matrix = np.array([shape.flatten() for shape in aligned_shapes])
-        
-        # Étape 3 : Analyse en composantes principales (ACP)
+        # PCA on shapes
         self.shape_pca = PCA()
         self.shape_pca.fit(shape_matrix)
         
         self.shape_modes = self.shape_pca.components_
         self.shape_mean_vector = self.shape_pca.mean_
-        print(f"Modèle de forme construit avec {len(self.shape_modes)} modes principaux.")
+        self.mean_shape = self.shape_mean_vector.reshape(-1, 2)
+        
+        print(f"Shape model built with {len(self.shape_modes)} principal modes.")
+
+        # Plot mean shape landmarks
+        plt.figure()
+        plt.scatter(self.mean_shape[:, 0], self.mean_shape[:, 1], color='red')
+        plt.title("Mean Shape Landmarks")
+        plt.axis('equal')
+        plt.show()
 
     def build_texture_model(self):
         """
-        Construit un modèle statistique pour les textures.
+        Build a statistical model for textures at multiple resolutions using a Gaussian pyramid.
         """
-        print("Construction du modèle de texture...")
-        # Étape 1 : Normalisation des textures
-        normalized_textures = []
-        for texture in self.textures:
-            norm_texture = (texture - np.mean(texture)) / np.std(texture)
-            normalized_textures.append(norm_texture)
-        self.mean_texture = np.mean(normalized_textures, axis=0)
+        print("Building texture model...")
+        self.texture_pyramids = []
+        self.texture_pca_models = []
         
-        # Étape 2 : Conversion des textures en vecteurs
-        texture_matrix = np.array([texture.flatten() for texture in normalized_textures])
+        # Create Gaussian pyramids for each texture
+        pyramid_levels = 3
+        for level in range(pyramid_levels):
+            pyramid_textures = [self._get_pyramid_level(texture, level) for texture in self.textures]
+            pyramid_matrix = np.array([texture.flatten() for texture in pyramid_textures])
+            
+            # Normalize textures
+            normalized_textures = (pyramid_matrix - pyramid_matrix.mean(axis=1, keepdims=True)) / \
+                                   (pyramid_matrix.std(axis=1, keepdims=True) + 1e-6)
+            
+            # PCA for each pyramid level
+            texture_pca = PCA()
+            texture_pca.fit(normalized_textures)
+            
+            self.texture_pyramids.append(pyramid_textures)
+            self.texture_pca_models.append(texture_pca)
+            print(f"Texture model for pyramid level {level} built with {len(texture_pca.components_)} modes.")
+
+    def warp_texture(self, mean_shape, target_shape, texture):
+        """
+        Warp the texture from the mean shape to the target shape using triangulation-based interpolation.
+        """
+        texture_image = texture.reshape(self.texture_size)
         
-        # Étape 3 : Analyse en composantes principales (ACP)
-        self.texture_pca = PCA()
-        self.texture_pca.fit(texture_matrix)
+        # Perform Delaunay triangulation on the mean shape
+        triangulation = Delaunay(mean_shape)
         
-        self.texture_modes = self.texture_pca.components_
-        self.texture_mean_vector = self.texture_pca.mean_
-        print(f"Modèle de texture construit avec {len(self.texture_modes)} modes principaux.")
+        warped_texture = np.zeros_like(texture_image)
+        
+        for simplex in triangulation.simplices:
+            src_points = mean_shape[simplex].astype(np.float32)
+            dst_points = target_shape[simplex].astype(np.float32)
+            
+            # Compute affine transform
+            affine_transform = cv2.getAffineTransform(src_points, dst_points)
+            
+            # Mask for the current triangle
+            mask = np.zeros(texture_image.shape, dtype=np.uint8)
+            cv2.fillConvexPoly(mask, dst_points.astype(np.int32), 1)
+            
+            # Warp the triangle region
+            warped_region = cv2.warpAffine(texture_image, affine_transform, texture_image.shape[::-1])
+            
+            # Blend the warped region into the result
+            warped_texture[mask == 1] = warped_region[mask == 1]
+        
+        # Plot warped texture
+        plt.figure()
+        plt.imshow(warped_texture, cmap='gray')
+        plt.title("Warped Texture Example")
+        plt.show()
+
+        return warped_texture
+
+    def _get_pyramid_level(self, texture, level):
+        """
+        Get a texture at a given pyramid level using Gaussian downsampling.
+        """
+        image = texture.reshape(self.texture_size)
+        for _ in range(level):
+            image = cv2.pyrDown(image)
+        return image
 
     def build_combined_model(self):
         """
-        Construit un modèle combiné forme + texture.
+        Build a combined model for shape and texture.
         """
-        print("Construction du modèle combiné...")
-        # Étape 1 : Obtenir les paramètres des formes et des textures
+        print("Building combined model...")
+        # Shape parameters from PCA
         shape_params = self.shape_pca.transform(
             np.array([shape.flatten() for shape in self.shapes])
         )
-        texture_params = self.texture_pca.transform(
-            np.array([texture.flatten() for texture in self.textures])
+        
+        # Texture parameters from the top pyramid level
+        texture_params = self.texture_pca_models[-1].transform(
+            [texture.flatten() for texture in self.texture_pyramids[-1]]
         )
         
-        # Étape 2 : Combinaison des paramètres
+        # Combine shape and texture parameters
         combined_data = np.hstack((shape_params, texture_params))
         
-        # Étape 3 : ACP sur les données combinées
+        # PCA on combined data
         self.combined_pca = PCA()
         self.combined_pca.fit(combined_data)
         
         self.combined_modes = self.combined_pca.components_
         self.combined_mean_vector = self.combined_pca.mean_
-        print(f"Modèle combiné construit avec {len(self.combined_modes)} modes principaux.")
+        print(f"Combined model built with {len(self.combined_modes)} principal modes.")
 
-    def generate_shape(self, b_s):
+    def generate_shape(self, shape_params):
         """
-        Génère une forme à partir des paramètres b_s.
-        :param b_s: Paramètres des modes de forme.
-        :return: Coordonnées des points de forme (n_points x 2).
+        Generate a shape from given shape parameters.
         """
-        shape_vector = self.shape_mean_vector + np.dot(self.shape_modes.T, b_s)
+        shape_vector = self.shape_mean_vector + np.dot(self.shape_modes.T, shape_params)
         return shape_vector.reshape(-1, 2)
 
-    def generate_texture(self, b_g):
+    def generate_texture(self, texture_params, level=0):
         """
-        Génère une texture à partir des paramètres b_g.
-        :param b_g: Paramètres des modes de texture.
-        :return: Texture générée sous forme de vecteur.
+        Generate a texture from given texture parameters at a specific pyramid level.
         """
-        return self.texture_mean_vector + np.dot(self.texture_modes.T, b_g)
+        texture_pca = self.texture_pca_models[level]
+        texture_mean = texture_pca.mean_
+        return texture_mean + np.dot(texture_pca.components_.T, texture_params)
 
-    def generate_combined(self, c):
+    def generate_combined(self, subject_idx):
         """
-        Génère une forme et une texture combinées à partir des paramètres c.
-        :param c: Paramètres combinés (forme + texture).
-        :return: (forme, texture)
+        Generate a shape and texture for a specific subject in the dataset.
         """
-        n_shape_modes = len(self.shape_modes)
-        b_s = c[:n_shape_modes]
-        b_g = c[n_shape_modes:]
+        shape_params = self.shape_pca.transform([self.shapes[subject_idx].flatten()])[0]
+        texture_params = self.texture_pca_models[-1].transform([self.texture_pyramids[-1][subject_idx].flatten()])[0]
         
-        shape = self.generate_shape(b_s)
-        texture = self.generate_texture(b_g)
+        shape = self.generate_shape(shape_params)
+        texture = self.generate_texture(texture_params, level=-1)
         return shape, texture
 
 
-# Exemple d'utilisation
-if __name__ == "__main__":
-    # Simuler des données de formes (100 échantillons, 68 points, 2 coordonnées)
-    n_samples = 100
-    n_points = 68
-    shapes = [np.random.rand(n_points, 2) for _ in range(n_samples)]
-    
-    # Simuler des textures associées (par exemple, 256 x 256 pixels par échantillon)
-    texture_size = 256 * 256
-    textures = [np.random.rand(texture_size) for _ in range(n_samples)]
-    
-    # Créer et construire le modèle
-    aam = ActiveAppearanceModel(shapes, textures)
-    aam.build_shape_model()
-    aam.build_texture_model()
-    aam.build_combined_model()
-    
-    # Générer une forme et une texture
-    example_params = np.random.rand(len(aam.combined_modes))  # Paramètres combinés aléatoires
-    generated_shape, generated_texture = aam.generate_combined(example_params)
-    
-    print("Forme générée :", generated_shape)
-    print("Texture générée :", generated_texture[:10])  # Afficher les 10 premiers pixels
